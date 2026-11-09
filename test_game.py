@@ -342,5 +342,365 @@ class TestLongSimulation(unittest.TestCase):
                 self.assertIn(g.state, ("playing", "won", "lost"))
 
 
+# ======================================================================
+#  New levels
+# ======================================================================
+from game import WATER, MUD, CAR, Car, Crate, SLEEP
+
+
+def level_game(level, seed=0, difficulty="Normal"):
+    g = Game(difficulty, seed=seed, level=level)
+    g.zombies.clear()
+    g.crates.clear()
+    return g
+
+
+def open_row(g, y, x0, x1):
+    """Turn the map into one open corridor along row y (everything else walls)."""
+    m = g.map
+    for yy in range(m.h):
+        for xx in range(m.w):
+            m.tiles[yy][xx] = BUILDING
+    for xx in range(x0, x1 + 1):
+        m.tiles[y][xx] = STREET
+    m.reachable = {(xx, y) for xx in range(x0, x1 + 1)}
+    m.cars, m.car_at = [], {}
+
+
+def add_car(g, tiles):
+    car = Car(tiles, 0)
+    for t in tiles:
+        g.map.tiles[t[1]][t[0]] = CAR
+        g.map.car_at[t] = car
+    g.map.cars.append(car)
+    return car
+
+
+class TestLevelGeneration(unittest.TestCase):
+    def test_every_level_connected(self):
+        for level in LEVEL_ORDER:
+            for seed in range(8):
+                g = Game("Hard", seed=seed, level=level)
+                self.assertTrue(g.map.helipad <= g.map.reachable, (level, seed))
+                self.assertTrue(g.map.safe_zone <= g.map.reachable, (level, seed))
+                for z in g.zombies:
+                    self.assertTrue(g.map.circle_free(z.x, z.y, z.radius))
+
+    def test_flood_has_water_and_mud(self):
+        g = Game("Normal", seed=3, level=2)
+        flat = [t for row in g.map.tiles for t in row]
+        self.assertGreater(flat.count(WATER), 20)
+        self.assertGreater(flat.count(MUD), 5)
+        self.assertEqual(g.map.tile(*g.map.start), STREET)
+
+    def test_bridge_has_cars_and_is_long(self):
+        g = Game("Normal", seed=1, level=4)
+        self.assertGreater(g.map.w, GRID_W)
+        self.assertGreaterEqual(len(g.map.cars), 15)
+        self.assertGreaterEqual(g.player.bottles, 1)
+
+
+class TestTerrain(unittest.TestCase):
+    def test_astar_prefers_dry_streets(self):
+        # Straight line through water (W) vs. a dry detour over the top
+        grid = ["#######",
+                "#.....#",
+                "#.###.#",
+                "#.WWW.#",
+                "#######"]
+
+        def cost(x, y):
+            c = grid[y][x]
+            return None if c == "#" else (WATER_PATH_COST if c == "W" else 1)
+        path, _ = astar((1, 3), (5, 3), cost, 7, 5)
+        self.assertNotIn((3, 3), path)
+
+    def test_water_halves_speed_and_splashes(self):
+        g = level_game(2)
+        open_row(g, 5, 2, 20)
+        p = g.player
+        p.x, p.y = 3.5, 5.5
+        g.update(0.05, move=(1, 0))
+        dry = p.x - 3.5
+        for x in range(2, 21):
+            g.map.tiles[5][x] = WATER
+        p.x = 3.5
+        p.noise_timer = 0
+        g.noises.clear()
+        g.update(0.05, move=(1, 0))
+        wet = p.x - 3.5
+        self.assertAlmostEqual(wet / dry, WATER_SPEED, places=1)
+        self.assertTrue(any(n.kind == "splash" and n.radius >= NOISE_SPLASH for n in g.noises))
+        self.assertGreater(p.noise_level, NOISE_WALK)       # walking in water is loud
+
+    def test_mud_slows_zombies(self):
+        def distance_walked(tile):
+            g = level_game(2)
+            open_row(g, 5, 2, 25)
+            for x in range(2, 26):
+                g.map.tiles[5][x] = tile
+            g.player.x, g.player.y = 24.5, 5.5
+            g.diff["sight"] = 0.5
+            z = Zombie(3.5, 5.5)
+            z.state, z.target, z.path = INVESTIGATE, (24, 5), None
+            g.zombies.append(z)
+            for _ in range(20):
+                g.update(0.05)
+            return z.x - 3.5
+        self.assertLess(distance_walked(MUD), distance_walked(STREET) * 0.75)
+
+
+class TestBridge(unittest.TestCase):
+    def test_cars_block_sight(self):
+        g = level_game(4)
+        open_row(g, 5, 2, 20)
+        add_car(g, [(8, 5)])
+        self.assertFalse(g.map.line_of_sight(4.5, 5.5, 12.5, 5.5))
+        self.assertTrue(g.map.is_solid(8, 5))
+
+    def test_bottle_noise_lures_zombie(self):
+        g = level_game(4)
+        open_row(g, 5, 2, 30)
+        g.player.x, g.player.y = 3.5, 5.5
+        g.diff["sight"] = 0.5                     # make sure it can't just see the player
+        z = Zombie(14.5, 5.5)
+        g.zombies.append(z)
+        g.player.bottles = 1
+        self.assertTrue(g.throw_bottle(9.5, 5.5))
+        self.assertEqual(g.player.bottles, 0)
+        for _ in range(16):
+            g.update(0.05)
+        self.assertEqual(z.state, INVESTIGATE)
+        self.assertEqual(z.target, (9, 5))
+        self.assertFalse(g.throw_bottle(9.5, 5.5))         # none left
+
+    def test_bottle_hitting_car_sets_off_alarm(self):
+        g = level_game(4)
+        open_row(g, 5, 2, 30)
+        car = add_car(g, [(10, 5), (11, 5)])
+        g.player.x, g.player.y = 4.5, 5.5
+        g.throw_bottle(14.5, 5.5)
+        for _ in range(20):
+            g.update(0.05)
+        self.assertTrue(car.alarm_used)
+        self.assertGreaterEqual(g.stats["alarms"], 1)
+
+    def test_manual_alarm_needs_a_car_nearby(self):
+        g = level_game(4)
+        open_row(g, 5, 2, 30)
+        g.player.x, g.player.y = 4.5, 5.5
+        self.assertFalse(g.trigger_alarm())
+        add_car(g, [(5, 5)])
+        self.assertTrue(g.trigger_alarm())
+        self.assertFalse(g.trigger_alarm())                # each alarm works once
+
+    def test_reach_checkpoint_wins(self):
+        g = level_game(4)
+        self.assertEqual(g.heli_state, "landed")
+        self.assertIsNone(g.heli_time_left)                # it never leaves
+        hx, hy = sorted(g.map.helipad)[0]
+        g.player.x, g.player.y = hx + 0.5, hy + 0.5
+        for _ in range(int(g.board_time / 0.05) + 3):
+            g.update(0.05)
+        self.assertEqual(g.state, "won")
+
+
+class TestSpecialZombies(unittest.TestCase):
+    def test_wandering_zombie_ignores_barricades(self):
+        g = empty_game()
+        open_row(g, 5, 2, 12)
+        g.player.x, g.player.y = 50, 50
+        g.map.tiles[5][7] = BARRICADE
+        g.map.barricade_hp[(7, 5)] = BARRICADE_HP
+        z = Zombie(5.5, 5.5)
+        z.path, z.target = [(6, 5), (7, 5), (8, 5)], (8, 5)
+        g.zombies.append(z)
+        for _ in range(60):
+            g.update(0.05)
+        self.assertEqual(g.map.tile(7, 5), BARRICADE)
+        self.assertEqual(g.map.barricade_hp[(7, 5)], BARRICADE_HP)
+
+    def test_brute_smashes_instantly_and_hits_for_two(self):
+        g = level_game(5)
+        open_row(g, 5, 2, 14)
+        g.player.x, g.player.y = 13.5, 5.5
+        g.map.tiles[5][7] = BARRICADE
+        g.map.barricade_hp[(7, 5)] = g.barricade_hp
+        z = Zombie(5.5, 5.5, "brute")
+        z.state, z.target, z.path = INVESTIGATE, (13, 5), None
+        g.zombies.append(z)
+        for _ in range(40):
+            g.update(0.05)
+            if g.map.tile(7, 5) == STREET:
+                break
+        self.assertEqual(g.map.tile(7, 5), STREET)
+        self.assertLess(g.time, 2.5)
+        g2 = level_game(5)
+        p = g2.player
+        g2.zombies.append(Zombie(p.x + 0.3, p.y, "brute"))
+        g2.update(0.02)
+        self.assertEqual(p.hp, PLAYER_MAX_HP - 2)
+
+    def test_screamer_alerts_whole_map_and_never_bites(self):
+        g = level_game(5)
+        p = g.player
+        x, y = open_street_near_player(g, 2, 3)
+        s = Zombie(x + 0.5, y + 0.5, "screamer")
+        far = Zombie(28.5, 18.5, "normal")
+        g.zombies += [s, far]
+        g.update(0.02)
+        self.assertEqual(s.state, CHASE)
+        self.assertEqual(far.state, INVESTIGATE)
+        self.assertEqual(g.stats["screams"], 1)
+        s.x, s.y = p.x + 0.2, p.y
+        g.update(0.02)
+        self.assertEqual(p.hp, PLAYER_MAX_HP)
+
+    def test_runner_gives_up_and_wanders(self):
+        g = empty_game()
+        z = Zombie(3.5, 3.5, "runner")
+        z.state, z.last_seen, z.lose_timer = CHASE, (3.5, 3.5), 0.0
+        g.player.x, g.player.y = 50, 50
+        g.zombies.append(z)
+        for _ in range(25):
+            g.update(0.05)
+        self.assertEqual(z.state, WANDER)
+
+    def test_hunter_aims_ahead_of_the_player(self):
+        g = level_game(5)
+        open_row(g, 5, 1, 28)
+        g.player.x, g.player.y = 12.5, 5.5
+        z = Zombie(3.5, 5.5, "hunter")
+        z.last_seen, z.last_vel, z.lose_timer = (12.5, 5.5), (2.4, 0.0), 0.0
+        ix, iy = g.predict_intercept(z)
+        self.assertGreater(ix, 13.5)                       # ahead, in the direction of travel
+        self.assertTrue(g._walkable_goal(ix, iy))
+        z.last_vel = (0.0, 0.0)
+        self.assertAlmostEqual(g.predict_intercept(z)[0], 12.5)   # standing still: no lead
+
+
+class TestFinalStand(unittest.TestCase):
+    def test_timer_pauses_outside_zone_and_win(self):
+        g = level_game(5)
+        g.spawn_timer = 1e9
+        self.assertEqual(g.heli_state, "incoming")
+        self.assertTrue(g.in_safe_zone)
+        start_left = g.heli_time_left
+        out = next(t for t in sorted(g.map.reachable)
+                   if t not in g.map.safe_zone and g.map.tile(*t) == STREET)
+        g.player.x, g.player.y = out[0] + 0.5, out[1] + 0.5
+        for _ in range(40):
+            g.update(0.05)
+        self.assertAlmostEqual(g.heli_time_left, start_left, places=3)
+        hx, hy = sorted(g.map.helipad)[0]
+        g.player.x, g.player.y = hx + 0.5, hy + 0.5
+        while g.heli_state == "incoming":
+            g.update(0.05)
+        for _ in range(int(BOARD_TIME / 0.05) + 3):
+            g.update(0.05)
+        self.assertEqual(g.state, "won")
+
+    def test_random_play_all_levels_no_crashes(self):
+        import random
+        for level in LEVEL_ORDER:
+            for seed in range(3):
+                rng = random.Random(seed)
+                g = Game("Normal", seed=seed, level=level)
+                mv = (0, 0)
+                for i in range(30 * 60):
+                    if i % 20 == 0:
+                        mv = rng.choice([(1, 0), (-1, 0), (0, 1), (0, -1), (0, 0), (1, 1)])
+                    throw = (g.player.x + rng.uniform(-6, 6), g.player.y + rng.uniform(-6, 6)) \
+                        if rng.random() < 0.01 else None
+                    g.update(1 / 30, mv, run=rng.random() < 0.3, place=rng.random() < 0.02,
+                             throw=throw, alarm=rng.random() < 0.01, flashlight=rng.random() < 0.01)
+                    g.pop_events()
+                    for z in g.zombies:
+                        self.assertTrue(g.map.circle_free(z.x, z.y, z.radius) or z.attacking)
+                    if g.state != "playing":
+                        break
+
+
+class TestHospital(unittest.TestCase):
+    def test_bsp_rooms_beds_and_far_elevator(self):
+        for seed in range(6):
+            g = Game("Normal", seed=seed, level=3)
+            m = g.map
+            self.assertGreaterEqual(len(m.rooms), 5)
+            self.assertTrue(m.beds)
+            sx, sy = m.start
+            ex, ey = sorted(m.helipad)[0]
+            self.assertGreater(abs(ex - sx) + abs(ey - sy), 10)       # the lift is far away
+            self.assertTrue(any(z.state == SLEEP for z in g.zombies))
+
+    def test_darkness_and_flashlight_vision(self):
+        g = level_game(3)
+        dark = len(g.visible)
+        self.assertTrue(g.toggle_flashlight())
+        best = 0
+        for facing in ((1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)):
+            g.player.facing = facing
+            g.update_fog()
+            best = max(best, len(g.visible))
+        self.assertGreater(best, dark)
+        lit = Game("Normal", seed=0, level=1)
+        self.assertLess(g.view_radius, lit.view_radius)
+
+    def test_flashlight_makes_you_easier_to_see(self):
+        g = level_game(3)
+        z = Zombie(1.5, 1.5)
+        off = g.sight_range(z)
+        g.player.flashlight = True
+        self.assertGreater(g.sight_range(z), off * 2)
+
+    def test_battery_runs_out(self):
+        g = level_game(3)
+        g.toggle_flashlight()
+        for _ in range(int(BATTERY_MAX / BATTERY_DRAIN / 0.05) + 5):
+            g.update(0.05)
+        self.assertFalse(g.player.flashlight)
+        self.assertFalse(g.toggle_flashlight())             # can't turn it back on
+        g.crates.append(Crate(*g.player.tile, "battery"))
+        g.update(0.02)
+        self.assertTrue(g.toggle_flashlight())
+
+    def test_sleeper_ignores_walking_but_wakes_to_running(self):
+        g = level_game(3)
+        open_row(g, 5, 2, 20)
+        z = Zombie(10.5, 5.5)
+        z.state = SLEEP
+        g.zombies.append(z)
+        g.emit_noise(8.5, 5.5, NOISE_WALK, "step")         # 2 tiles away, quiet
+        self.assertEqual(z.state, SLEEP)
+        g.emit_noise(6.5, 5.5, NOISE_RUN, "step")          # 4 tiles away, loud
+        self.assertEqual(z.state, INVESTIGATE)
+
+    def test_sleeper_wakes_when_you_bump_into_it(self):
+        g = level_game(3)
+        open_row(g, 5, 2, 20)
+        g.player.x, g.player.y = 9.6, 5.5
+        z = Zombie(10.5, 5.5)
+        z.state = SLEEP
+        g.zombies.append(z)
+        g.update(0.02)
+        self.assertNotEqual(z.state, SLEEP)
+
+    def test_elevator_win_flow(self):
+        g = level_game(3)
+        p = g.player
+        for _ in range(3):
+            g.crates.append(Crate(*p.tile, "radio"))
+            g.update(0.02)
+        self.assertEqual(g.heli_state, "incoming")
+        while g.heli_state == "incoming":
+            g.update(0.05)
+        hx, hy = sorted(g.map.helipad)[0]
+        p.x, p.y = hx + 0.5, hy + 0.5
+        for _ in range(int(BOARD_TIME / 0.05) + 3):
+            g.update(0.05)
+        self.assertEqual(g.state, "won")
+        self.assertIn("elevator", g.reason)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

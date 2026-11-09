@@ -35,8 +35,22 @@ python -m unittest test_game.py -v
 | Shift (hold) | Run: fast, but LOUD, and uses stamina |
 | Space / E | Place a barricade on the tile you are facing (green outline = allowed) |
 | F1 / Tab | AI debug view: shows every zombie, its A* path, sight range and state |
+| L | Flashlight on/off (Level 3) |
+| T / mouse click | Throw a bottle (Level 4) - a dotted arc shows where it lands |
+| F | Set off the alarm of the car you're standing next to (Level 4) |
 | P / Esc | Pause (M = menu, Q = quit) |
-| R | Play again (on the end screen) |
+| R / N | Play again / next level (on the end screen) |
+
+In the menu, pick a level with the cards (or Left/Right) and a difficulty (Up/Down), then START.
+
+### Levels
+| Level | Hurdle | Goal |
+| --- | --- | --- |
+| 1 - The Dark City | Fog, noise, hordes | 3 radio parts, then the helicopter |
+| 2 - The Flooded Market | **Water**: half speed and every step splashes (loud). **Mud**: slows you *and* zombies. Zombies prefer dry streets, so wade through water to shake off chasers. | 3 fuel cans, then the rescue boat at the dock |
+| 3 - The Hospital Blackout | **Darkness**: you see only 3 tiles. **L** toggles a flashlight with a long beam, but zombies spot the light 1.5x further (in the dark they only see 0.6x as far). The battery drains, and battery pickups recharge it. **Sleeping zombies** (Zz) only wake to loud noise or if you bump into them. | 3 fuses, then the elevator |
+| 4 - The Highway Bridge | Long, open, scrolling bridge. **Cars** block movement and sight (hide behind them). **Car alarms** (F, or hit a car with a bottle) wail for 8 s and pull zombies in. **Bottles** make noise where they land. | Reach the military checkpoint at the far end |
+| 5 - The Final Stand | Hold a walled plaza for 90 s (the timer pauses if you leave). Reinforced barricades block sight. New zombies: **Runner**, **Screamer**, **Brute**, **Hunter**. | Survive, then board the helicopter |
 
 **Goal:** collect 3 radio parts (blue boxes) → the helicopter lands 20 s later
 → stand on the helipad for 3 s to escape. It leaves after 30 s!
@@ -100,8 +114,37 @@ Each zombie is a goal-based agent.
 ### 6. Fog of war (`Game.update_fog`)
 The player only sees tiles within 6 tiles that are in line of sight. Explored tiles stay dimly visible.
 
-### 7. Procedural generation (`CityMap._build_layout`)
-Every game creates a new random city, verified with BFS.
+### 7. Procedural generation (`CityMap.generate`)
+Every game creates a new random level (city, flooded market, bridge or plaza), verified with BFS.
+
+### 8. BSP map generation and the SLEEP state (Level 3)
+- `CityMap._build_hospital` uses **Binary Space Partitioning**: the map is split in two, then each half
+  is split again (up to 5 times). Each final piece gets a room, and each pair of sibling pieces is joined
+  by a corridor, so every room is connected. Two extra corridors add loops. The elevator goes in the room
+  furthest from the start (measured by BFS walking distance).
+- A fourth FSM state, **SLEEP**: no sight; hears noise only within 60% of its radius; wakes up if you
+  come within 1.2 tiles. Walking (2.5 -> 1.5) sneaks past, running (7.5 -> 4.5) wakes them.
+
+### 8b. Terrain costs (Level 2)
+A* step costs: street 1, mud 3, water 4, barricade 6. Water and mud also slow movement
+(x0.5 and x0.6), so the costs combine travel time with a preference for dry ground. Zombies walk
+around a flooded street when the detour is short and wade through only when it saves a lot.
+
+### 9. Distractions use the noise system (Level 4)
+A bottle creates a `Noise` where it lands, and a car alarm creates one every second for 8 s.
+The zombies need no new code: their FSM already sends them to INVESTIGATE any noise they hear.
+Cars block line of sight, so the sight check already handles hiding.
+
+### 10. Zombie types (Level 5, `ZOMBIE_KINDS` in settings.py)
+They all share the same FSM and A*. Only the numbers change:
+| Type | Change |
+| --- | --- |
+| Runner | x1.6 chase speed; gives up after 0.9 s and goes straight back to WANDER |
+| Screamer | Never bites. When it sees you, every zombie on the map gets an INVESTIGATE target at your position |
+| Brute | Slow, bites for 2, breaks barricades in one hit, and its A* barricade cost is only 2 (it goes straight through) |
+| Hunter | Uses **prediction** (`Game.predict_intercept`): it estimates where you are from your last seen position and velocity, looks ahead by (distance / its speed) seconds, and runs A* to that point to cut you off. The red crosshair shows its prediction |
+
+Wandering zombies never smash barricades. Only zombies that are investigating or chasing break through.
 
 ---
 
@@ -113,10 +156,10 @@ Every game creates a new random city, verified with BFS.
 | `game.py` | Game rules and all zombie AI (no Pygame, so it can be tested) |
 | `pathfinding.py` | A* search and BFS |
 | `settings.py` | Every tunable number (speeds, noise radii, difficulty levels) |
-| `test_game.py` | 27 automated tests for A*, the map, the player and the zombie AI |
+| `ui.py` | Cartoon wooden UI widgets (panels, cards, buttons, signs) |
+| `test_game.py` | 52 automated tests for A*, every level, terrain, distractions and each zombie type |
 
 ## Ideas to extend it
 - Add a second AI algorithm (BFS or greedy best-first) and compare nodes expanded against A* in your report.
 - Make zombies remember noises with a priority queue (loudest/closest first).
-- Add a "smart" zombie type that predicts where you are heading and cuts you off.
 - Add a save file for high scores (fastest escape time per difficulty).
